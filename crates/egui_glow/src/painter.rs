@@ -94,6 +94,10 @@ pub struct Painter {
     vbo: glow::Buffer,
     element_array_buffer: glow::Buffer,
 
+    /// Every mesh of the frame, put together for one upload.
+    batch_vertices: Vec<egui::epaint::Vertex>,
+    batch_indices: Vec<u32>,
+
     textures: HashMap<egui::TextureId, glow::Texture>,
 
     next_native_tex_id: u64,
@@ -264,6 +268,8 @@ impl Painter {
                 supports_srgb_framebuffer,
                 vbo,
                 element_array_buffer,
+                batch_vertices: Vec::new(),
+                batch_indices: Vec::new(),
                 textures: Default::default(),
                 next_native_tex_id: 1 << 32,
                 textures_to_destroy: Vec::new(),
@@ -407,7 +413,12 @@ impl Painter {
         self.assert_not_destroyed();
 
         unsafe { self.prepare_painting(screen_size_px, pixels_per_point) };
+        unsafe { self.upload_meshes(clipped_primitives) };
 
+        // Where the next mesh's indices start in the uploaded ones, and the
+        // texture last bound, which the next mesh often shares.
+        let mut first_index = 0;
+        let mut bound = None;
         for egui::ClippedPrimitive {
             clip_rect,
             primitive,
@@ -417,7 +428,8 @@ impl Painter {
 
             match primitive {
                 Primitive::Mesh(mesh) => {
-                    self.paint_mesh(mesh);
+                    self.paint_mesh(mesh, first_index, &mut bound);
+                    first_index += mesh.indices.len();
                 }
                 Primitive::Callback(callback) => {
                     if callback.rect.is_positive() {
@@ -452,6 +464,7 @@ impl Painter {
 
                         // Restore state:
                         unsafe { self.prepare_painting(screen_size_px, pixels_per_point) };
+                        bound = None;
                     }
                 }
             }
@@ -467,35 +480,56 @@ impl Painter {
         }
     }
 
+    /// Uploads every mesh's vertices in one buffer and their indices, moved
+    /// past the meshes before them, in another. Each mesh then draws from
+    /// its range of indices. Uploading each mesh by itself cost two calls
+    /// into the driver per mesh, and in a browser each of those crosses into
+    /// JavaScript and on to the GPU process: a hundred and seventy a frame
+    /// for an ordinary window, the most expensive call egui made on the web.
+    unsafe fn upload_meshes(&mut self, clipped_primitives: &[egui::ClippedPrimitive]) {
+        self.batch_vertices.clear();
+        self.batch_indices.clear();
+        for clipped in clipped_primitives {
+            if let Primitive::Mesh(mesh) = &clipped.primitive {
+                let base = self.batch_vertices.len() as u32;
+                self.batch_vertices.extend_from_slice(&mesh.vertices);
+                self.batch_indices
+                    .extend(mesh.indices.iter().map(|index| index + base));
+            }
+        }
+        unsafe {
+            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+            self.gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                bytemuck::cast_slice(&self.batch_vertices),
+                glow::STREAM_DRAW,
+            );
+            self.gl
+                .bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.element_array_buffer));
+            self.gl.buffer_data_u8_slice(
+                glow::ELEMENT_ARRAY_BUFFER,
+                bytemuck::cast_slice(&self.batch_indices),
+                glow::STREAM_DRAW,
+            );
+        }
+    }
+
+    /// Draws a mesh uploaded by [`Self::upload_meshes`], whose indices start
+    /// at `first_index`, binding its texture unless it is `bound` already.
     #[inline(never)] // Easier profiling
-    fn paint_mesh(&mut self, mesh: &Mesh) {
+    fn paint_mesh(&mut self, mesh: &Mesh, first_index: usize, bound: &mut Option<glow::Texture>) {
         debug_assert!(mesh.is_valid(), "Mesh is not valid");
         if let Some(texture) = self.texture(mesh.texture_id) {
             unsafe {
-                self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
-                self.gl.buffer_data_u8_slice(
-                    glow::ARRAY_BUFFER,
-                    bytemuck::cast_slice(&mesh.vertices),
-                    glow::STREAM_DRAW,
-                );
-
-                self.gl
-                    .bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.element_array_buffer));
-                self.gl.buffer_data_u8_slice(
-                    glow::ELEMENT_ARRAY_BUFFER,
-                    bytemuck::cast_slice(&mesh.indices),
-                    glow::STREAM_DRAW,
-                );
-
-                self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-            }
-
-            unsafe {
+                if *bound != Some(texture) {
+                    self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    *bound = Some(texture);
+                }
                 self.gl.draw_elements(
                     glow::TRIANGLES,
                     mesh.indices.len() as i32,
                     glow::UNSIGNED_INT,
-                    0,
+                    (first_index * std::mem::size_of::<u32>()) as i32,
                 );
             }
 
